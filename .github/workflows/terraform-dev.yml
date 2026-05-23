@@ -1,0 +1,228 @@
+################################################################################
+# .github/workflows/terraform-dev.yml
+#
+# DEV ENVIRONMENT WORKFLOW
+#
+# Trigger logic:
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │  Push to `develop` branch          →  terraform PLAN only   │
+#   │  PR opened/updated → `develop`     →  terraform PLAN only   │
+#   │  PR merged into `main` (dev label) →  terraform APPLY       │
+#   └─────────────────────────────────────────────────────────────┘
+#
+# Branch strategy assumed:
+#   develop  →  feature branches are PR'd into develop
+#   main     →  develop is PR'd into main (triggers apply for BOTH envs)
+#
+# Authentication: Workload Identity Federation (no long-lived SA keys).
+# State:          GCS bucket  tf-state-<DEV_PROJECT_ID>-dev
+################################################################################
+
+name: "Terraform — DEV"
+
+on:
+  # ── Plan: any push directly to develop ──────────────────────────────────────
+  push:
+    branches:
+      - develop
+    paths:
+      - "environments/dev/**"
+      - "modules/**"
+
+  # ── Plan: PR opened/updated targeting develop ────────────────────────────────
+  pull_request:
+    branches:
+      - develop
+    paths:
+      - "environments/dev/**"
+      - "modules/**"
+
+  # ── Apply: PR merged into main (develop → main merge triggers dev apply) ─────
+  # We use pull_request with type `closed` + merged=true so apply only fires
+  # when a merge actually happens, not when a PR is just closed/rejected.
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+    paths:
+      - "environments/dev/**"
+      - "modules/**"
+
+env:
+  TF_VERSION:      "1.8.0"
+  TF_WORKING_DIR:  "environments/dev"
+  # State bucket name — must match what bootstrap/create_state_buckets.sh created
+  STATE_BUCKET:    "tf-state-${{ secrets.GCP_PROJECT_ID_DEV }}-dev"
+  STATE_PREFIX:    "terraform/state"
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 1 — PLAN
+  # Runs on: push to develop, PR opened/updated targeting develop
+  # Skips on: merged PR (that goes to the apply job)
+  # ════════════════════════════════════════════════════════════════════════════
+  terraform-plan:
+    name: "Plan — dev"
+    runs-on: ubuntu-latest
+
+    # Only run plan when this is NOT a closed/merged PR into main
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.action != 'closed' &&
+       github.base_ref == 'develop')
+
+    permissions:
+      contents: read
+      id-token:       write   # Workload Identity Federation
+      pull-requests:  write   # Post plan output as PR comment
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Auth (Workload Identity — no SA keys stored in GitHub) ──────────────
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ secrets.GCP_SA_EMAIL_DEV }}
+
+      # ── Terraform setup ─────────────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # ── Init ────────────────────────────────────────────────────────────────
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="prefix=${{ env.STATE_PREFIX }}" \
+            -reconfigure \
+            -input=false
+
+      # ── Validate ────────────────────────────────────────────────────────────
+      - name: Terraform Validate
+        id: validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate -no-color
+
+      # ── Plan ────────────────────────────────────────────────────────────────
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file=terraform.tfvars \
+            -no-color \
+            -input=false \
+            -out=tfplan-dev
+        # Don't fail the workflow if plan finds no changes
+        continue-on-error: false
+
+      # ── Post plan as PR comment (only on pull_request events) ────────────────
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `### 🔍 Terraform Plan — \`dev\`
+
+            **Init:** \`${{ steps.init.outcome }}\`
+            **Validate:** \`${{ steps.validate.outcome }}\`
+            **Plan:** \`${{ steps.plan.outcome }}\`
+
+            <details>
+            <summary>Show Plan Output</summary>
+
+            \`\`\`hcl
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            > 📌 Merge this PR into \`develop\` to keep it as plan-only.
+            > 📌 Merge \`develop → main\` to trigger **apply** for dev.
+
+            *Triggered by: @${{ github.actor }} — \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 2 — APPLY
+  # Runs on: PR merged into main (develop → main)
+  # ════════════════════════════════════════════════════════════════════════════
+  terraform-apply:
+    name: "Apply — dev"
+    runs-on: ubuntu-latest
+
+    # Only run when a PR is actually merged (not just closed)
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.base_ref == 'main'
+
+    # Require manual approval in GitHub Environments before applying to dev
+    environment: dev
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ secrets.GCP_SA_EMAIL_DEV }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Re-run init so the runner has the right backend configured
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="prefix=${{ env.STATE_PREFIX }}" \
+            -reconfigure \
+            -input=false
+
+      # Re-run plan immediately before apply to ensure we apply current state
+      - name: Terraform Plan (pre-apply)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file=terraform.tfvars \
+            -input=false \
+            -out=tfplan-dev
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            tfplan-dev
+
+      # ── Print key outputs after apply ────────────────────────────────────────
+      - name: Terraform Output
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform output

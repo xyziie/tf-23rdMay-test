@@ -1,0 +1,20 @@
+# Terraform state — never commit, always stored in GCS
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+tfplan-*
+crash.log
+
+# Generated plan-only config (created at CI runtime)
+cloudbuild-plan-only.yaml
+
+# Secrets — never commit
+*.auto.tfvars
+secrets.tfvars
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
