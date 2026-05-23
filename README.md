@@ -29,6 +29,7 @@ gcp-tf-v2/
 
 ---
 
+
 ## Branch strategy & trigger map
 
 ```
